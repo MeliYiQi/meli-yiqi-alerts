@@ -8,17 +8,24 @@ from twilio.rest import Client
 
 app = Flask(__name__)
 
+def env(name: str, default=None):
+    return os.environ.get(name, default)
+
 def must_env(name: str) -> str:
     v = os.environ.get(name)
     if not v:
         raise RuntimeError(f"Missing env var: {name}")
     return v
 
-def db():
-    return psycopg2.connect(must_env("DATABASE_URL"))
+def db_conn():
+    # No romper el server si no está configurado
+    database_url = env("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("Missing env var: DATABASE_URL")
+    return psycopg2.connect(database_url)
 
 def init_db():
-    with db() as conn, conn.cursor() as cur:
+    with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
         create table if not exists stock_latest (
           sku text primary key,
@@ -42,7 +49,6 @@ def init_db():
           updated_at timestamp not null default now()
         );
         """)
-init_db()
 
 def send_whatsapp(body: str) -> str:
     client = Client(must_env("TWILIO_ACCOUNT_SID"), must_env("TWILIO_AUTH_TOKEN"))
@@ -57,14 +63,23 @@ def send_whatsapp(body: str) -> str:
 def home():
     return "OK", 200
 
+# ---------- TEST ----------
 @app.post("/notify/test")
 def notify_test():
-    sid = send_whatsapp("✅ OK: Render + Twilio + DB listos.")
-    return jsonify({"ok": True, "sid": sid})
+    try:
+        sid = send_whatsapp("✅ OK: Render + Twilio funcionando.")
+        return jsonify({"ok": True, "sid": sid})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-# --------- INGEST: STOCK (Stock_Disponible-YiQi.xlsx) ----------
+# ---------- INGEST: STOCK (Stock_Disponible-YiQi.xlsx) ----------
 @app.post("/ingest/stock-yiqi")
 def ingest_stock_yiqi():
+    try:
+        init_db()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"DB error: {e}"}), 500
+
     f = request.files.get("file")
     if not f:
         return jsonify({"ok": False, "error": "Falta archivo en field 'file'"}), 400
@@ -78,7 +93,7 @@ def ingest_stock_yiqi():
     if sku_col is None:
         return jsonify({"ok": False, "error": "No encuentro columna SKU (Artículo - SKU)"}), 400
 
-    # Sumar columnas numéricas como stock total
+    # stock total = suma de todas columnas numéricas (depósitos)
     num_cols = [c for c in raw.columns if c != sku_col and pd.api.types.is_numeric_dtype(raw[c])]
     if not num_cols:
         return jsonify({"ok": False, "error": "No encuentro columnas numéricas de stock"}), 400
@@ -88,7 +103,8 @@ def ingest_stock_yiqi():
     df["stock_total"] = df[num_cols].fillna(0).sum(axis=1)
 
     rows = df[[sku_col, "stock_total"]].values.tolist()
-    with db() as conn, conn.cursor() as cur:
+
+    with db_conn() as conn, conn.cursor() as cur:
         for sku, stock in rows:
             cur.execute("""
                 insert into stock_latest(sku, stock, updated_at)
@@ -97,11 +113,17 @@ def ingest_stock_yiqi():
                   stock=excluded.stock,
                   updated_at=now();
             """, (sku, float(stock)))
+
     return jsonify({"ok": True, "rows": len(rows), "num_cols_used": [str(c) for c in num_cols]})
 
-# --------- INGEST: VENTAS (Excel con hoja Recompra; ventas 30d en col F) ----------
+# ---------- INGEST: VENTAS (hoja Recompra, ventas 30d en col F) ----------
 @app.post("/ingest/sales-recompra")
 def ingest_sales_recompra():
+    try:
+        init_db()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"DB error: {e}"}), 500
+
     f = request.files.get("file")
     if not f:
         return jsonify({"ok": False, "error": "Falta archivo en field 'file'"}), 400
@@ -113,10 +135,10 @@ def ingest_sales_recompra():
 
     df = pd.read_excel(xls, sheet_name=sheet)
     if df.shape[1] < 6:
-        return jsonify({"ok": False, "error": "La hoja Recompra debe tener al menos 6 columnas (ventas 30d en F)"}), 400
+        return jsonify({"ok": False, "error": "Recompra debe tener al menos 6 columnas (ventas 30d en F)"}), 400
 
-    sku_col = df.columns[0]          # A
-    sales30_col = df.columns[5]      # F
+    sku_col = df.columns[0]     # A
+    sales30_col = df.columns[5] # F
 
     out = df[[sku_col, sales30_col]].copy()
     out.columns = ["sku", "sales_30d"]
@@ -124,7 +146,8 @@ def ingest_sales_recompra():
     out["sales_30d"] = pd.to_numeric(out["sales_30d"], errors="coerce").fillna(0)
 
     rows = out.values.tolist()
-    with db() as conn, conn.cursor() as cur:
+
+    with db_conn() as conn, conn.cursor() as cur:
         for sku, s30 in rows:
             cur.execute("""
                 insert into sales_latest(sku, sales_30d, updated_at)
@@ -133,27 +156,33 @@ def ingest_sales_recompra():
                   sales_30d=excluded.sales_30d,
                   updated_at=now();
             """, (sku, float(s30)))
+
     return jsonify({"ok": True, "rows": len(rows)})
 
-# --------- INGEST: PROX INGRESOS (PROX_INGRESOS_template.xlsx) ----------
+# ---------- INGEST: PROX INGRESOS ----------
 @app.post("/ingest/prox-ingresos")
 def ingest_prox_ingresos():
+    try:
+        init_db()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"DB error: {e}"}), 500
+
     f = request.files.get("file")
     if not f:
         return jsonify({"ok": False, "error": "Falta archivo en field 'file'"}), 400
 
     df = pd.read_excel(io.BytesIO(f.read()))
-    # columnas esperadas: SKU, next_inbound_date, qty(opc), nota(opc)
     cols = {str(c).strip(): c for c in df.columns}
     if "SKU" not in cols or "next_inbound_date" not in cols:
         return jsonify({"ok": False, "error": "Necesito columnas SKU y next_inbound_date"}), 400
 
     sku = df[cols["SKU"]].astype(str).str.strip()
     dts = pd.to_datetime(df[cols["next_inbound_date"]], errors="coerce").dt.date
+
     qty = pd.to_numeric(df[cols["qty"]], errors="coerce") if "qty" in cols else None
     note = df[cols["nota"]].astype(str) if "nota" in cols else None
 
-    with db() as conn, conn.cursor() as cur:
+    with db_conn() as conn, conn.cursor() as cur:
         for i in range(len(df)):
             sk = sku.iloc[i]
             if not sk:
@@ -170,19 +199,29 @@ def ingest_prox_ingresos():
                   note=excluded.note,
                   updated_at=now();
             """, (sk, dt, q, n))
+
     return jsonify({"ok": True, "rows": int(len(df))})
 
-# --------- DIGEST DIARIO: COBERTURA < 30 DÍAS (ventas_30d/30) ----------
+# ---------- DIGEST STOCK ----------
 @app.post("/digest/stock")
 def digest_stock():
+    secret = env("DIGEST_SECRET")
+    if not secret:
+        return jsonify({"ok": False, "error": "Missing env var: DIGEST_SECRET"}), 500
+
     key = request.args.get("key", "")
-    if key != must_env("DIGEST_SECRET"):
+    if key != secret:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    try:
+        init_db()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"DB error: {e}"}), 500
 
     target_days = 30.0
     today = date.today()
 
-    with db() as conn, conn.cursor() as cur:
+    with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
           select s.sku, s.stock,
                  coalesce(v.sales_30d,0) as sales_30d,
@@ -200,7 +239,6 @@ def digest_stock():
             continue
         coverage = float(stock) / sales_per_day
 
-        # Silenciar si entra antes de que se corte la cobertura
         if next_inbound:
             days_until_inbound = (next_inbound - today).days
             if days_until_inbound >= 0 and days_until_inbound <= coverage:
@@ -209,7 +247,7 @@ def digest_stock():
         if coverage < target_days:
             alerts.append((sku, coverage, float(stock), float(sales_30d), next_inbound))
 
-    alerts.sort(key=lambda x: x[1])  # menor cobertura primero
+    alerts.sort(key=lambda x: x[1])
 
     if not alerts:
         sid = send_whatsapp("✅ Stock OK: ningún SKU con cobertura < 30 días (ventas_30d/30).")
@@ -225,5 +263,3 @@ def digest_stock():
 
     sid = send_whatsapp("\n".join(lines))
     return jsonify({"ok": True, "count": len(alerts), "sid": sid})
-
-

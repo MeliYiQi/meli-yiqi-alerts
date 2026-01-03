@@ -1,3 +1,9 @@
 Flask==3.0.3
 gunicorn==22.0.0
 twilio==9.3.6
+pandas==2.2.2
+openpyxl==3.1.5
+psycopg2-binary==2.9.9
+requests==2.32.3
+
+

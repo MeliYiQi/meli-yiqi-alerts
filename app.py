@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import os
 import json
+import pandas as pd
 from datetime import datetime
 
 app = Flask(__name__)
@@ -17,14 +18,12 @@ def notify_test():
     }), 200
 
 @app.post("/ingest/stock-yiqi")
-@app.post("/ingest/stock-yiqi")
 def ingest_stock_yiqi():
     from datetime import datetime
-    import pandas as pd
 
     received_at = datetime.utcnow().isoformat() + "Z"
 
-    # 1) JSON
+    # 1) JSON (por si más adelante YiQi manda webhook)
     if request.is_json:
         payload = request.get_json(silent=True) or {}
         return jsonify({
@@ -36,11 +35,12 @@ def ingest_stock_yiqi():
 
     # 2) Archivo
     if "file" not in request.files:
-        return jsonify({"ok": False, "error": "Send JSON or multipart file with key 'file'"}), 400
+        return jsonify({"ok": False, "error": "Send multipart file with key 'file'"}), 400
 
     f = request.files["file"]
     filename = (f.filename or "").lower()
 
+    # leer CSV / Excel
     try:
         if filename.endswith(".csv"):
             df = pd.read_csv(f)
@@ -51,32 +51,59 @@ def ingest_stock_yiqi():
     except Exception as e:
         return jsonify({"ok": False, "error": f"Failed to read file: {str(e)}"}), 400
 
-    cols = {c.lower().strip(): c for c in df.columns}
+    # normalizar nombres de columnas
+    cols_norm = {c.lower().strip(): c for c in df.columns}
 
+    # SKU: tu export trae "Articulo - SKU"
     sku_col = None
-    stock_col = None
-
-    for k in ["sku", "seller sku", "codigo", "código", "cod", "sku_seller", "seller_sku"]:
-        if k in cols:
-            sku_col = cols[k]
+    for k in ["articulo - sku", "artículo - sku", "sku", "seller sku", "seller_sku", "codigo", "código", "cod"]:
+        if k in cols_norm:
+            sku_col = cols_norm[k]
             break
 
-    for k in ["stock", "qty", "quantity", "available", "disponible", "stock disponible", "stock_disponible"]:
-        if k in cols:
-            stock_col = cols[k]
-            break
-
-    if not sku_col or not stock_col:
+    if not sku_col:
         return jsonify({
             "ok": False,
-            "error": "Could not detect SKU/Stock columns",
+            "error": "Could not detect SKU column",
             "columns": list(df.columns)
         }), 400
 
-    out = df[[sku_col, stock_col]].copy()
-    out.columns = ["sku", "stock"]
+    # Depósitos a sumar (si existen)
+    deposit_keys = [
+        "deposito 1", "depósito 1",
+        "deposito 2", "depósito 2",
+        "deposito 2r", "depósito 2r",
+        "deposito 3", "depósito 3",
+    ]
+    deposit_cols = [cols_norm[k] for k in deposit_keys if k in cols_norm]
+
+    # Fallback si no hay depósitos: usar FULL o Stock Disponible / Available
+    stock_col = None
+    for k in ["full", "stock disponible", "stock_disponible", "available", "qty", "quantity", "stock", "disponible"]:
+        if k in cols_norm:
+            stock_col = cols_norm[k]
+            break
+
+    # construir output
+    out = df[[sku_col]].copy()
+    out.columns = ["sku"]
     out["sku"] = out["sku"].astype(str).str.strip()
-    out["stock"] = pd.to_numeric(out["stock"], errors="coerce").fillna(0).astype(int)
+
+    if deposit_cols:
+        tmp = df[deposit_cols].copy()
+        for c in deposit_cols:
+            tmp[c] = pd.to_numeric(tmp[c], errors="coerce").fillna(0)
+        out["stock"] = tmp.sum(axis=1).astype(int)
+        detected_stock = {"mode": "sum_deposits", "columns": deposit_cols}
+    elif stock_col:
+        out["stock"] = pd.to_numeric(df[stock_col], errors="coerce").fillna(0).astype(int)
+        detected_stock = {"mode": "single_column", "column": stock_col}
+    else:
+        return jsonify({
+            "ok": False,
+            "error": "Could not detect Stock columns",
+            "columns": list(df.columns)
+        }), 400
 
     total_rows = int(len(out))
     total_skus = int(out["sku"].nunique())
@@ -87,11 +114,12 @@ def ingest_stock_yiqi():
         "type": "file",
         "received_at": received_at,
         "filename": f.filename,
-        "detected_columns": {"sku": sku_col, "stock": stock_col},
+        "detected_columns": {"sku": sku_col, "stock": detected_stock},
         "total_rows": total_rows,
         "unique_skus": total_skus,
         "low_stock_sample": low_stock.to_dict(orient="records")
     }), 200
+
 
     received_at = datetime.utcnow().isoformat() + "Z"
 
@@ -118,4 +146,5 @@ def ingest_stock_yiqi():
         "ok": False,
         "error": "Send JSON or multipart file with key 'file'"
     }), 400
+
 

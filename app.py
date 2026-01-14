@@ -54,6 +54,86 @@ def home():
 @app.get("/notify/test")
 def notify_test():
     return jsonify({"ok": True, "msg": "notify/test endpoint OK"}), 200
+@app.get("/stock/low")
+def stock_low():
+    max_stock = request.args.get("max", default="2")
+    limit = request.args.get("limit", default="200")
+
+    try:
+        max_stock = int(max_stock)
+        limit = int(limit)
+    except:
+        return jsonify({"ok": False, "error": "max and limit must be integers"}), 400
+
+    try:
+        ensure_tables()
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT sku, stock_real, stock_alerta, updated_at
+                    FROM stock_latest
+                    WHERE stock_alerta <= %s
+                    ORDER BY stock_alerta ASC, stock_real ASC, sku ASC
+                    LIMIT %s
+                """, (max_stock, limit))
+                rows = cur.fetchall()
+
+        return jsonify({
+            "ok": True,
+            "max": max_stock,
+            "count": len(rows),
+            "items": [
+                {"sku": r[0], "stock": r[1], "stock_alerta": r[2], "updated_at": r[3].isoformat()}
+                for r in rows
+            ]
+        }), 200
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"DB query failed: {str(e)}"}), 500
+
+
+@app.get("/stock/sku/<path:sku>")
+def stock_by_sku(sku):
+    try:
+        ensure_tables()
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT sku, stock_real, stock_alerta, updated_at
+                    FROM stock_latest
+                    WHERE sku = %s
+                """, (sku,))
+                row = cur.fetchone()
+
+        if not row:
+            return jsonify({"ok": False, "error": "SKU not found"}), 404
+
+        return jsonify({
+            "ok": True,
+            "sku": row[0],
+            "stock": row[1],
+            "stock_alerta": row[2],
+            "updated_at": row[3].isoformat()
+        }), 200
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"DB query failed: {str(e)}"}), 500
+
+
+@app.get("/stock/last-ingest")
+def stock_last_ingest():
+    try:
+        ensure_tables()
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT MAX(ingested_at) FROM stock_snapshot;")
+                row = cur.fetchone()
+
+        last_ingest = row[0].isoformat() if row and row[0] else None
+        return jsonify({"ok": True, "last_ingest_at": last_ingest}), 200
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"DB query failed: {str(e)}"}), 500
 
 
 @app.post("/ingest/stock-yiqi")
@@ -215,4 +295,5 @@ def ingest_stock_yiqi():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+
 

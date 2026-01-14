@@ -1,6 +1,39 @@
 from flask import Flask, request, jsonify
 import os
 import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
+
+def get_db_conn():
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL not set")
+    return psycopg2.connect(db_url)
+
+def ensure_tables():
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_latest (
+                sku TEXT PRIMARY KEY,
+                stock_real INTEGER NOT NULL,
+                stock_alerta INTEGER NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_snapshot (
+                id BIGSERIAL PRIMARY KEY,
+                ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                source_filename TEXT,
+                sku TEXT NOT NULL,
+                stock_real INTEGER NOT NULL,
+                stock_alerta INTEGER NOT NULL
+            );
+            """)
+        conn.commit()
+
+
 from datetime import datetime
 
 app = Flask(__name__)
@@ -94,10 +127,50 @@ def ingest_stock_yiqi():
         out["stock"] = pd.to_numeric(df[stock_col], errors="coerce").fillna(0).astype(int)
         detected_stock = {"mode": "single_column", "column": stock_col}
     else:
+            # Persistir en base
+    ensure_tables()
+
+    rows = [
+        (r["sku"], int(r["stock"]), int(r["stock_alerta"]))
+        for r in out[["sku", "stock", "stock_alerta"]].to_dict(orient="records")
+    ]
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            # snapshot histórico
+            execute_values(
+                cur,
+                """
+                INSERT INTO stock_snapshot (source_filename, sku, stock_real, stock_alerta)
+                VALUES %s
+                """,
+                [(f.filename, sku, sr, sa) for sku, sr, sa in rows],
+                page_size=1000
+            )
+
+            # latest (upsert)
+            execute_values(
+                cur,
+                """
+                INSERT INTO stock_latest (sku, stock_real, stock_alerta, updated_at)
+                VALUES %s
+                ON CONFLICT (sku)
+                DO UPDATE SET
+                    stock_real = EXCLUDED.stock_real,
+                    stock_alerta = EXCLUDED.stock_alerta,
+                    updated_at = NOW()
+                """,
+                rows,
+                page_size=1000
+            )
+        conn.commit()
+
         return jsonify({
             "ok": False,
             "error": "Could not detect Stock columns",
             "columns": list(df.columns)
+            "db_rows_inserted": total_rows,
+
         }), 400
 
     # Stock para alertas (no negativos)
@@ -123,3 +196,4 @@ def ingest_stock_yiqi():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+

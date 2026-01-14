@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 import os
-import json
 import pandas as pd
 from datetime import datetime
 
@@ -10,17 +9,14 @@ app = Flask(__name__)
 def home():
     return "OK", 200
 
+
 @app.get("/notify/test")
 def notify_test():
-    return jsonify({
-        "ok": True,
-        "msg": "notify/test endpoint OK"
-    }), 200
+    return jsonify({"ok": True, "msg": "notify/test endpoint OK"}), 200
+
 
 @app.post("/ingest/stock-yiqi")
 def ingest_stock_yiqi():
-    from datetime import datetime
-
     received_at = datetime.utcnow().isoformat() + "Z"
 
     # 1) JSON (por si más adelante YiQi manda webhook)
@@ -40,7 +36,7 @@ def ingest_stock_yiqi():
     f = request.files["file"]
     filename = (f.filename or "").lower()
 
-    # leer CSV / Excel
+    # Leer CSV / Excel
     try:
         if filename.endswith(".csv"):
             df = pd.read_csv(f)
@@ -51,10 +47,10 @@ def ingest_stock_yiqi():
     except Exception as e:
         return jsonify({"ok": False, "error": f"Failed to read file: {str(e)}"}), 400
 
-    # normalizar nombres de columnas
+    # Normalizar nombres de columnas
     cols_norm = {c.lower().strip(): c for c in df.columns}
 
-    # SKU: tu export trae "Articulo - SKU"
+    # SKU: tu export trae "Artículo - SKU"
     sku_col = None
     for k in ["articulo - sku", "artículo - sku", "sku", "seller sku", "seller_sku", "codigo", "código", "cod"]:
         if k in cols_norm:
@@ -72,19 +68,18 @@ def ingest_stock_yiqi():
     deposit_keys = [
         "deposito 1", "depósito 1",
         "deposito 2", "depósito 2",
-        "deposito 2r", "depósito 2r",
         "deposito 3", "depósito 3",
     ]
     deposit_cols = [cols_norm[k] for k in deposit_keys if k in cols_norm]
 
-    # Fallback si no hay depósitos: usar FULL o Stock Disponible / Available
+    # Fallback si no hay depósitos: usar FULL u otras columnas genéricas
     stock_col = None
     for k in ["full", "stock disponible", "stock_disponible", "available", "qty", "quantity", "stock", "disponible"]:
         if k in cols_norm:
             stock_col = cols_norm[k]
             break
 
-    # construir output
+    # Construir salida
     out = df[[sku_col]].copy()
     out.columns = ["sku"]
     out["sku"] = out["sku"].astype(str).str.strip()
@@ -105,9 +100,14 @@ def ingest_stock_yiqi():
             "columns": list(df.columns)
         }), 400
 
+    # Stock para alertas (no negativos)
+    out["stock_alerta"] = out["stock"].clip(lower=0)
+
     total_rows = int(len(out))
     total_skus = int(out["sku"].nunique())
-    low_stock = out[out["stock"] <= 2].sort_values("stock").head(20)
+
+    # Low stock usando stock_alerta
+    low_stock = out[out["stock_alerta"] <= 2].sort_values("stock_alerta").head(20)
 
     return jsonify({
         "ok": True,
@@ -117,34 +117,9 @@ def ingest_stock_yiqi():
         "detected_columns": {"sku": sku_col, "stock": detected_stock},
         "total_rows": total_rows,
         "unique_skus": total_skus,
-        "low_stock_sample": low_stock.to_dict(orient="records")
+        "low_stock_sample": low_stock[["sku", "stock", "stock_alerta"]].to_dict(orient="records")
     }), 200
 
 
-    received_at = datetime.utcnow().isoformat() + "Z"
-
-    if request.is_json:
-        payload = request.get_json(silent=True) or {}
-        return jsonify({
-            "ok": True,
-            "type": "json",
-            "received_at": received_at,
-            "keys": list(payload.keys())
-        }), 200
-
-    if "file" in request.files:
-        f = request.files["file"]
-        return jsonify({
-            "ok": True,
-            "type": "file",
-            "filename": f.filename,
-            "content_type": f.content_type,
-            "received_at": received_at
-        }), 200
-
-    return jsonify({
-        "ok": False,
-        "error": "Send JSON or multipart file with key 'file'"
-    }), 400
-
-
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))

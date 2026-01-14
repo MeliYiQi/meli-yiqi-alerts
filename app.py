@@ -172,20 +172,22 @@ def ingest_stock_yiqi():
                 )
 
                 # latest upsert
+                # latest upsert (updated_at lo pone la DB)
                 execute_values(
-                    cur,
-                    """
-                    INSERT INTO stock_latest (sku, stock_real, stock_alerta, updated_at)
-                    VALUES %s
-                    ON CONFLICT (sku)
-                    DO UPDATE SET
-                        stock_real = EXCLUDED.stock_real,
-                        stock_alerta = EXCLUDED.stock_alerta,
-                        updated_at = NOW()
-                    """,
-                    rows_latest,
-                    page_size=1000
+                cur,
+                """
+                INSERT INTO stock_latest (sku, stock_real, stock_alerta)
+                VALUES %s
+                ON CONFLICT (sku)
+                DO UPDATE SET
+                    stock_real = EXCLUDED.stock_real,
+                    stock_alerta = EXCLUDED.stock_alerta,
+                    updated_at = NOW()
+                """,
+                rows_latest,
+                page_size=1000
                 )
+
             conn.commit()
 
         db_rows_inserted = total_rows
@@ -213,3 +215,4 @@ def ingest_stock_yiqi():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+
